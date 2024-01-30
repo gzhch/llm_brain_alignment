@@ -398,8 +398,10 @@ def custom_forward(model,
         
             
         if 'ffn_gate' in activations.keys():
-            gates = decoder_layer.mlp.act_fn(decoder_layer.mlp.gate_proj(hidden_states))
-            hidden_states = decoder_layer.mlp.down_proj(gates * decoder_layer.mlp.up_proj(hidden_states))
+            # gates = decoder_layer.mlp.act_fn(decoder_layer.mlp.gate_proj(hidden_states))
+            # hidden_states = decoder_layer.mlp.down_proj(gates * decoder_layer.mlp.up_proj(hidden_states))
+            gates = decoder_layer.mlp.act_fn(decoder_layer.mlp.gate_proj(hidden_states)) * decoder_layer.mlp.up_proj(hidden_states)
+            hidden_states = decoder_layer.mlp.down_proj(gates)
             activations['ffn_gate'].append(gates.cpu())
             del gates
             torch.cuda.empty_cache()

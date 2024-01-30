@@ -40,6 +40,98 @@ class LLAMA():
             raise NotImplementError
         return torch.tensor(story_array).long()
 
+    def get_neuron_activation_and_loss(self, input):
+        model = self.model
+        result = ana.custom_forward(model, input['input_ids'].cuda(), inspect_acts=['ffn_gate'])
+        logits = result['logits']
+        labels = input['input_ids']
+        input_ids = input['input_ids'][:, :-1]
+
+        # calculate loss
+        shift_logits = logits[..., :-1, :].contiguous().view(-1, 32000)
+        shift_labels = labels[..., 1:].contiguous().view(-1)
+        loss_fct = torch.nn.CrossEntropyLoss(reduce=False)
+        loss = loss_fct(shift_logits, shift_labels).view(labels.shape[0], -1)
+
+        b = 5
+        mask = input['attention_mask'][:, :-1] == 1
+        loss = loss * mask + -100 * (~mask)
+        input_ids = input_ids * mask + -100 * (~mask)
+        expanded_loss = torch.cat([torch.ones(loss.shape[0], b) * -100, loss, torch.ones(loss.shape[0], b) * -100], dim=1)
+        expanded_input_ids = torch.cat([torch.ones(input_ids.shape[0], b) * -100, input_ids, torch.ones(input_ids.shape[0], b) * -100], dim=1).int()
+
+        # signal delay
+        losses = []
+        context = []
+        for offset in range(2 * b):
+            losses.append(expanded_loss[:, offset: offset + loss.shape[1]])
+            context.append(expanded_input_ids[:, offset: offset + loss.shape[1]])
+        losses = torch.stack(losses).transpose(0,1).transpose(2,1)
+        context = torch.stack(context).transpose(0,1).transpose(2,1)
+
+        ## remove padding tokens
+        losses = losses.view(-1, 2 * b)[mask.flatten()]
+        context = context.view(-1, 2 * b)[mask.flatten()]
+
+        ffn_gate_all_layer = torch.stack(result['ffn_gate'])[:, :, :-1, :]
+        l, bs, seq_len, h = ffn_gate_all_layer.shape
+        ffn_gate_all_layer = ffn_gate_all_layer.reshape(l, bs * seq_len, h).transpose(0, 1)
+        ffn_gate_all_layer = ffn_gate_all_layer[mask.flatten()]
+
+        res = dict(context=context, loss=losses, ffn_gate=ffn_gate_all_layer)
+
+        return res
+
+
+    def get_act(self, dataset, cache_name, layers, acts, text_name='text', batch_size=16, start_batch=0, end_batch=5):
+        cache_dir = os.path.join(self.cache_dir, cache_name)
+        cache_subdir = os.path.join(cache_dir, f'bs_{batch_size}_{start_batch}-{end_batch}')
+        
+        ## load from cache if possible
+        if os.path.exists(cache_subdir):
+            if 'context' not in acts.keys():
+                with open(os.path.join(cache_subdir, 'context.pickle'), 'rb') as f:
+                    acts['context'] = pickle.load(f)
+
+            if 'loss' not in acts.keys():
+                with open(os.path.join(cache_subdir, 'loss.pickle'), 'rb') as f:
+                    acts['loss'] = pickle.load(f)
+
+            for layer in layers:
+                if f'layer_{layer}' not in acts.keys():
+                    with open(os.path.join(cache_subdir, f'ffn_gate_{layer}.pickle'), 'rb') as f:
+                        acts[f'layer_{layer}'] = pickle.load(f)
+        
+        ## if cache not exist, then create one
+        else:
+            os.makedirs(cache_subdir, exist_ok=True)
+
+            acts = []
+
+            for k in range(start_batch, end_batch):
+                input = self.tokenizer(dataset[text_name][k * batch_size: (k + 1) * batch_size], return_tensors='pt', padding='longest')
+                acts.append(self.get_neuron_activation_and_loss(input))
+
+            context = torch.cat([i['context'] for i in acts], dim=0).numpy()
+            loss = torch.cat([i['loss'] for i in acts], dim=0).numpy()
+            ffn_gate = torch.cat([i['ffn_gate'] for i in acts], dim=0).numpy()
+
+            del acts
+            acts = dict(context=context, loss=loss)
+
+            with open(os.path.join(cache_subdir, 'context.pickle'), 'wb') as f:
+                pickle.dump(context, f)
+
+            with open(os.path.join(cache_subdir, 'loss.pickle'), 'wb') as f:
+                pickle.dump(loss, f)
+
+            for layer in range(ffn_gate.shape[1]):
+                with open(os.path.join(cache_subdir, f'ffn_gate_{layer}.pickle'), 'wb') as f:
+                    acts[f'layer_{layer}'] = ffn_gate[:, layer, :]
+                    pickle.dump(acts[f'layer_{layer}'], f)
+
+        return acts
+
     def get_clm_loss(self, story, words, context_size, act_name='ffn_gate', context_token=True, use_cache=True, chunk = None):
         cache_file_name = f'{story}-context_size_{context_size}-clm_loss.pkl'
         cache_file_path = os.path.join(self.cache_dir, cache_file_name)
