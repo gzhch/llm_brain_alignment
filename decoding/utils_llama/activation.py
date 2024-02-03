@@ -110,7 +110,6 @@ import utils_llama.modeling_llama as modeling_llama
   
 
 
-
 # def inspect_activation(model, input_ids, inspect_layer = -1, inspect_ffn = False, forward_layer_ids = None):
 #     activations = {'ffn':[], 'attn':[]}
     
@@ -160,6 +159,14 @@ import utils_llama.modeling_llama as modeling_llama
 #         hidden_states = residual + hidden_states
 #     return activations, hidden_states
   
+class FFNProjector:
+    def __init__(self, layer1, layer2, net):
+        self.layer1 = layer1
+        self.layer2 = layer2
+        self.net = net
+        self.act = None
+        
+
 @torch.no_grad()
 def custom_forward(model, 
                    input_ids, 
@@ -171,12 +178,23 @@ def custom_forward(model,
                    skip_layer_ids = None, 
                    record_layer_ids = None, 
                    return_logits = True,
-                   add_attn = True,
-                   add_ffn = True,
+                   add_attn = None,
+                   add_ffn = None,
                    fake_act_args = None,
                    use_cache = True,
                    draft_config = None,
+                   fake_ffn = None,
+                   fake_ffn_direct_contribution_only = False,
+                   fake_ffn_neuron_filter = None,
+                   fake_ffn_neuron_filter_zero = False,
+                   return_all_act = False,
                    debug = False):
+
+    # explain some hyperparameters (2024.2.1)
+    # fake_ffn: Projector or List of Projectors
+    # fake_ffn_direct_contribution_only: bool, whether to consider the indirect contribution of ffn activations
+    # fake_ffn_neuron_filter: Dict of neuron indices for various layers, indicating positions that uses predicted values to replace real values.
+    # fake_ffn_neuron_filter_zero: bool, replace the unfiltered neuron with zeros if True, otherwise real values
     ### inspect_acts : ffn, attn, ffn_gate
     # forward_layer_ids : layers that are selected as the small model
     # record_layer_ids : layers that directly contribute to the final logits
@@ -184,6 +202,8 @@ def custom_forward(model,
     assert forward_layer_ids is None or skip_layer_ids is None
     
     # support attn ffn ffn_gate layer_input
+
+    # if return_all_act:
     activations = {i:[] for i in inspect_acts}
 
     batch_size,  seq_length = input_ids.shape
@@ -227,11 +247,7 @@ def custom_forward(model,
         attention_mask = torch.ones((batch_size, seq_length_with_past), dtype=torch.bool, device=inputs_embeds.device)
         attention_mask = model.model._prepare_decoder_attention_mask(attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length)
     
-    #print(attention_mask.bool().int().tolist())
-#     print(attention_mask.shape)
-#     print(position_ids.shape)
-#     print(past_key_values[0][0].shape)
-    
+
     hidden_states = inputs_embeds
     output_states = inputs_embeds
     
@@ -263,7 +279,6 @@ def custom_forward(model,
         
     next_decoder_cache = () if use_cache else None
     
-    # print(forward_layer_ids)
     
     for idx in list(range(len(model.model.layers))):
         
@@ -273,10 +288,9 @@ def custom_forward(model,
             continue
             
         decoder_layer = model.model.layers[idx]
-        if idx > 3 and idx < 37:
-            decoder_layer_self_attn = model.model.layers[idx].self_attn
-        else:
-            decoder_layer_self_attn = model.model.layers[idx].self_attn
+
+        decoder_layer_self_attn = model.model.layers[idx].self_attn
+
         decoder_layer_mlp = model.model.layers[idx].mlp
         
         past_key_value = past_key_values[idx] if past_key_values is not None else None
@@ -387,9 +401,10 @@ def custom_forward(model,
         if use_cache:
             next_decoder_cache += (present_key_value,)
             
-        
-        if add_attn and idx in record_layer_ids:
+        if add_attn is None or (idx in add_attn):
+        # if add_attn and idx in record_layer_ids:
             output_states = output_states + hidden_states.to(output_states.device)
+
         hidden_states = residual_attn.to(hidden_states.device) + hidden_states
         
         residual_mlp = hidden_states
@@ -398,9 +413,67 @@ def custom_forward(model,
         
             
         if 'ffn_gate' in activations.keys():
-            # gates = decoder_layer.mlp.act_fn(decoder_layer.mlp.gate_proj(hidden_states))
-            # hidden_states = decoder_layer.mlp.down_proj(gates * decoder_layer.mlp.up_proj(hidden_states))
-            gates = decoder_layer.mlp.act_fn(decoder_layer.mlp.gate_proj(hidden_states)) * decoder_layer.mlp.up_proj(hidden_states)
+
+            gates, fake_gates = None, None
+            is_predicted = False
+
+            if fake_ffn is None:
+                gates = decoder_layer.mlp.act_fn(decoder_layer.mlp.gate_proj(hidden_states)) * decoder_layer.mlp.up_proj(hidden_states)
+            
+            elif type(fake_ffn) is not list:
+                if idx == fake_ffn.layer2:
+                    fake_gates = fake_ffn.act
+                    # gates = fake_gates
+                    is_predicted = True
+                # if idx != fake_ffn.layer2 or fake_ffn_direct_contribution_only:
+                #     gates = decoder_layer.mlp.act_fn(decoder_layer.mlp.gate_proj(hidden_states)) * decoder_layer.mlp.up_proj(hidden_states)
+                gates = decoder_layer.mlp.act_fn(decoder_layer.mlp.gate_proj(hidden_states)) * decoder_layer.mlp.up_proj(hidden_states)
+                if idx == fake_ffn.layer1:
+                    fake_ffn.act = fake_ffn.net.to(gates.device)(gates)
+
+            else:
+                l1toproj = {fake_ffn[i].layer1 : i for i in range(len(fake_ffn))}
+                l2toproj = {fake_ffn[i].layer2 : i for i in range(len(fake_ffn))}
+                if idx in l2toproj.keys():
+                    assert fake_ffn[l2toproj[idx]].act is not None
+                    fake_gates = fake_ffn[l2toproj[idx]].act
+                    # gates = fake_gates
+                    is_predicted = True
+                # if idx not in l2toproj.keys() or fake_ffn_direct_contribution_only:
+                #     gates = decoder_layer.mlp.act_fn(decoder_layer.mlp.gate_proj(hidden_states)) * decoder_layer.mlp.up_proj(hidden_states)
+                gates = decoder_layer.mlp.act_fn(decoder_layer.mlp.gate_proj(hidden_states)) * decoder_layer.mlp.up_proj(hidden_states)
+                if idx in l1toproj.keys():
+                    fake_ffn[l1toproj[idx]].act = fake_ffn[l1toproj[idx]].net.to(gates.device)(gates)
+
+            # print(l1toproj, l2toproj)
+            # print(idx)
+
+            # if fake_ffn is not None and idx == fake_ffn.layer2:
+            #     gates = fake_ffn.act
+            # else:
+            #     # gates = decoder_layer.mlp.act_fn(decoder_layer.mlp.gate_proj(hidden_states))
+            #     # hidden_states = decoder_layer.mlp.down_proj(gates * decoder_layer.mlp.up_proj(hidden_states))
+            #     gates = decoder_layer.mlp.act_fn(decoder_layer.mlp.gate_proj(hidden_states)) * decoder_layer.mlp.up_proj(hidden_states)
+
+            # if fake_ffn is not None and idx == fake_ffn.layer1:
+            #     fake_ffn.act = fake_ffn.net.to(gates.device)(gates)
+
+            # apply neuron filter to the fake_gates
+            if fake_ffn_neuron_filter is not None and idx in fake_ffn_neuron_filter.keys() and fake_gates is not None:
+                neuron_filter = fake_ffn_neuron_filter[idx].to(fake_gates.device)
+                if fake_ffn_neuron_filter_zero:
+                    fake_gates = fake_gates * neuron_filter
+                else:
+                    fake_gates = fake_gates * neuron_filter + gates * (~neuron_filter)
+            
+            # if consider the full contribution of fake ffn, then replace gates with fake_gates
+            if not fake_ffn_direct_contribution_only and fake_gates is not None:
+                gates = fake_gates
+
+            fake_hidden_states = None
+            if fake_ffn_direct_contribution_only and fake_gates is not None:
+                fake_hidden_states = decoder_layer.mlp.down_proj(fake_gates)
+
             hidden_states = decoder_layer.mlp.down_proj(gates)
             activations['ffn_gate'].append(gates.cpu())
             del gates
@@ -409,8 +482,15 @@ def custom_forward(model,
             hidden_states = decoder_layer_mlp(hidden_states)
         if 'ffn' in activations.keys():
             activations['ffn'].append(hidden_states.cpu())
-        if add_ffn and idx in record_layer_ids:
-            output_states = output_states + hidden_states.to(output_states.device)
+        
+        if add_ffn is None or (idx in add_ffn):
+
+            # if fake_hidden_states is not None, then it means only direct contributions need to be considered
+            if fake_hidden_states is not None:
+                output_states = output_states + fake_hidden_states.to(output_states.device)
+            else: 
+                output_states = output_states + hidden_states.to(output_states.device)
+
         if skip_layer_ids is not None and idx in skip_layer_ids:
             hidden_states = residual_attn
         else:
@@ -603,7 +683,7 @@ def custom_forward_dev(model,
     #print('attn', t)
     logits = None
     if return_logits or 'logits' in activations.keys():
-        # hidden_states = output_states
+        hidden_states = output_states
         hidden_states = model.model.norm(hidden_states)
         logits = model.lm_head(hidden_states).cpu()
         activations['logits'] = logits.float()

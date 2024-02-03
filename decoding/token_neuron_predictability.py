@@ -73,13 +73,13 @@ for story in stories:
 
 
 model_dir = '/ossfs/workspace/nas/gzhch/data/models/Llama-2-7b-hf'
-model = AutoModelForCausalLM.from_pretrained(
-    model_dir, 
-    device_map='auto',
-    torch_dtype=torch.float16,
-).eval()
+# model = AutoModelForCausalLM.from_pretrained(
+#     model_dir, 
+#     device_map='auto',
+#     torch_dtype=torch.float16,
+# ).eval()
 
-# model = None
+model = None
 
 tokenizer = AutoTokenizer.from_pretrained(model_dir)
 

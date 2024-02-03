@@ -21,10 +21,9 @@ import torch.optim as optim
 from itertools import chain
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--layer2", type = int, required = True)
+parser.add_argument("--seed", type = int, default=0)
 args = parser.parse_args()
-
-torch.manual_seed(0)
+torch.manual_seed(args.seed)
 
 model_dir = '/ossfs/workspace/nas/gzhch/data/models/Llama-2-7b-hf'
 model = AutoModelForCausalLM.from_pretrained(
@@ -32,8 +31,6 @@ model = AutoModelForCausalLM.from_pretrained(
     device_map='auto',
     torch_dtype=torch.float16,
 ).eval()
-
-# model = None
 
 tokenizer = AutoTokenizer.from_pretrained(model_dir)
 tokenizer.pad_token = tokenizer.eos_token
@@ -52,6 +49,7 @@ def load_data(task_name, n_shot=1, seed=42):
         'wmt' : '/ossfs/workspace/nas/gzhch/data/datasets/wmt14_de-en_test',
         'wikitext2' : '/ossfs/workspace/nas/gzhch/data/datasets/wikitext-2-v1',
         'wikitext_dense' : '/ossfs/workspace/nas/gzhch/data/datasets/wikitext-2-v1',
+        'wikitext_eval' : '/ossfs/workspace/nas/gzhch/data/datasets/wikitext-2-v1',
     }
     if task_name == 'gsm8k':
         dataset = datasets.load_dataset(data_dirs[task_name])
@@ -59,6 +57,10 @@ def load_data(task_name, n_shot=1, seed=42):
         dataset = datasets.load_from_disk(data_dirs[task_name])
         dataset = dataset['train'].filter(lambda x: len(x['text'])>100) 
         dataset = dataset.select(random.sample(range(len(dataset)), 1000))
+
+    elif task_name == 'wikitext_eval':
+        dataset = datasets.load_from_disk(data_dirs[task_name])
+        dataset = dataset['test'].filter(lambda x: len(x['text'])>100) 
 
     elif task_name == 'wikitext_dense':
         def tokenize_texts(examples):
@@ -174,106 +176,63 @@ def train(net, train_set, stim_neurons=None, resp_neurons=None, max_step=100000)
             logs.append(f'Epoch [{b+1}/{total_batch}], Train Loss: {loss.item():.6f}, Eval Loss: {eval_loss:.6f}')
     return logs
 
+def evaluate_ppl(eval_data, model, fake_ffn=None, num_of_batch=3, **forwrd_args):
+    ppls = []
+    batch_size = 100
+    for b in range(num_of_batch):
+        input = tokenizer(eval_data['text'][b * batch_size: (b + 1) * batch_size], padding='longest', return_tensors='pt')
+        result = ana.custom_forward(model, input['input_ids'].cuda(), inspect_acts=['ffn_gate'], fake_ffn=fake_ffn, **forwrd_args)
+        logits = result['logits']
+        labels = input['input_ids']
+        input_ids = input['input_ids'][:, :-1]
 
-# load dataset
-wiki_data = load_data('wikitext_dense')
-
-
- 
-train_set = wiki_data['train']
-stim_neurons = None
-resp_neurons = None
-input_size = 11008 if stim_neurons is None else len(stim_neuron)
-output_size = 11008 if resp_neurons is None else len(resp_neuron)
-batch_size = 10
-max_step = 100
-lr = 0.01
-
-
-
-# get test data once and for all
-test_data = []
-for b in range(5):
-    input_ids = wiki_data['validation'][b * batch_size: (b + 1) * batch_size]['input_ids']
-    input_ids = torch.tensor(input_ids)
-    input = dict(input_ids=input_ids, attention_mask=torch.ones(input_ids.shape))
-    with torch.no_grad():
-        res = llama.get_neuron_activation_and_loss(input)
-        test_data.append(res)
-test_data = {k: torch.cat([i[k] for i in test_data]) for k in test_data[0].keys()}
+        # calculate loss
+        shift_logits = logits[..., :-1, :].contiguous().view(-1, 32000)
+        shift_labels = labels[..., 1:].contiguous().view(-1)
+        loss_fct = torch.nn.CrossEntropyLoss(reduce=False)
+        loss = loss_fct(shift_logits, shift_labels).view(labels.shape[0], -1)
+        t = (loss * input['attention_mask'][:, :-1]).sum(dim=1)/input['attention_mask'].sum(dim=1)
+        ppls += torch.exp(t).tolist()
+    ppl = torch.nan_to_num(torch.tensor(ppls)).mean().tolist()
+    return ppl
 
 
-layer2 = args.layer2
-projectors = []
-for layer1 in range(0, 32, 2):
-# for layer1 in [10]:
-    net = LinearProjector(input_size, output_size).cuda()
-    proj = dict(layer1=layer1, 
-                layer2=layer2,
-                net=net,
-                optimizer=optim.Adagrad(net.parameters(), lr=lr),
-                log=open(os.path.join(log_dir, f'{layer1}-{layer2}.txt'), 'w'))
-    projectors.append(proj)
+eval_data = load_data('wikitext_eval')
 
-criterion = nn.MSELoss()
+log_file = open('/ossfs/workspace/nas/gzhch/br/ACL_result/blockwise_proj_direct_noskip_ppl.jsonl', 'a')
+# log_file = open('/ossfs/workspace/nas/gzhch/br/ACL_result/blockwise_proj_noskip_ppl.jsonl', 'a')
 
-### get text set
-test_X, test_Y = [], []
+random_net = LinearProjector(11008, 11008).half()
+zero_net = LinearProjector(11008, 11008).half()
+zero_net.fc.weight.data = torch.zeros(zero_net.fc.weight.data.shape).half()
+zero_net.fc.bias.data = torch.zeros(zero_net.fc.bias.data.shape).half()
 
 
-logs = []
-# layer1, layer2 = 10, 15
-total_batch = len(train_set) // batch_size
-total_batch = min(total_batch, max_step)
+block_size = 8
 
-for b in range(total_batch):
-    input_ids = train_set[b * batch_size: (b + 1) * batch_size]['input_ids']
-    input_ids = torch.tensor(input_ids)
-    input = dict(input_ids=input_ids, attention_mask=torch.ones(input_ids.shape))
-    with torch.no_grad():
-        res = llama.get_neuron_activation_and_loss(input)
+for layer1 in range(0, 32, block_size):
+    projs = []
+    random_projs = []
+    zero_projs = []
+    # for layer2 in range(layer1 + 2, layer1 + block_size - 1, 2):
+    for layer2 in range(layer1 + 2, layer1 + block_size - 1, 1):
+        layer1_tmp = layer2 - 1
+        proj = ana.FFNProjector(layer1_tmp, layer2, torch.load(f'/ossfs/workspace/cache_v2/net_{layer1_tmp}_{layer2}.pt'))
+        random_proj = ana.FFNProjector(layer1_tmp, layer2, random_net)
+        zero_proj = ana.FFNProjector(layer1_tmp, layer2, zero_net)
+        projs.append(proj)
+        random_projs.append(random_proj)
+        zero_projs.append(zero_proj)
+    ppl = evaluate_ppl(eval_data, model, projs, fake_ffn_direct_contribution_only=True)
+    ppl_random = evaluate_ppl(eval_data, model, random_projs, fake_ffn_direct_contribution_only=True)
+    ppl_zero = evaluate_ppl(eval_data, model, zero_projs, fake_ffn_direct_contribution_only=True)
 
-    for proj in projectors:
-        # print('xxxx')
-        layer1 = proj['layer1']
-        layer2 = proj['layer2']
-        # net = proj['net']
-        # optimizer = proj['optimizer']
+    # ppl = evaluate_ppl(eval_data, model, projs)
+    # ppl_random = evaluate_ppl(eval_data, model, random_projs)
+    # ppl_zero = evaluate_ppl(eval_data, model, zero_projs)
 
-        if stim_neurons is not None:
-            X = res['ffn_gate'][:, layer1, stim_neurons].cuda().float()
-            test_X = test_data['ffn_gate'][:, layer1, stim_neurons].cuda().float()
-        else:
-            X = res['ffn_gate'][:, layer1, :].cuda().float()
-            test_X = test_data['ffn_gate'][:, layer1, :].cuda().float()
-        if resp_neurons is not None:
-            Y = res['ffn_gate'][:, layer2, resp_neurons].cuda().float()
-            test_Y = test_data['ffn_gate'][:, layer2, resp_neurons].cuda().float()
-        else:
-            Y = res['ffn_gate'][:, layer2, :].cuda().float()
-            test_Y = test_data['ffn_gate'][:, layer2, :].cuda().float()
-
-        output = proj['net'](X)
-        loss = criterion(output, Y)
-    
-        proj['optimizer'].zero_grad() 
-        (loss * output.shape[1]).backward()        
-        proj['optimizer'].step()       
+    json.dump(dict(layer1=layer1, ppl=ppl, ppl_random=ppl_random, ppl_zero=ppl_zero), log_file)
+    log_file.write('\n')
+    log_file.flush()
         
-        if (b+1) % 1 == 0:
-            eval_loss = eval(test_X.cuda(), test_Y.cuda(), proj['net']).item()
-            log_string = f'{layer1} {layer2} Step [{b+1}/{total_batch}], Train Loss: {loss.item():.6f}, Eval Loss: {eval_loss:.6f}\n'
-            print(log_string)
-            proj['log'].write(log_string)
-            proj['log'].flush()
-
-for proj in projectors:
-    layer1 = proj['layer1']
-    layer2 = proj['layer2']
-    save_path = os.path.join(log_dir, f'net_{layer1}_{layer2}.pt')
-    torch.save(proj['net'].half(), save_path)
-
-
-
-
 

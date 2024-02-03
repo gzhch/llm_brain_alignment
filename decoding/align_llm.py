@@ -52,7 +52,7 @@ parser.add_argument("--chunk", type = int, default = 0)
 
 args = parser.parse_args()
 
-log_name = f'test_{args.window}-layer_{args.layer}_{args.layer2}-{args.act_name}.txt'
+log_name = f'innerllm_{args.window}-layer_{args.layer}_{args.layer2}-{args.act_name}.txt'
 log_dir = os.path.join(config.RESULT_DIR, log_name)
 log_file = open(log_dir, 'w')
 
@@ -126,7 +126,7 @@ with open(os.path.join(config.DATA_TRAIN_DIR, "sess_to_story.json"), "r") as f:
 for sess in args.sessions:
     stories.extend(sess_to_story[str(sess)])
 
-stories = stories[:10]
+stories = stories[:40]
 
 model_dir = '/ossfs/workspace/nas/gzhch/data/models/Llama-2-7b-hf'
 # model = AutoModelForCausalLM.from_pretrained(
@@ -167,12 +167,12 @@ stim_dict = {story : get_stim_torch(args, [story], llama, delay=False)[0] for st
 resp_dict = {story : get_stim_torch(args2, [story], llama, delay=False)[0] for story in stories}
 
 # noise_model = torch.zeros([len(vox), len(vox)]).cuda()
-for hstory in stories:
+for hstory in stories[:10]:
     tstim, hstim = torch.vstack([stim_dict[tstory] for tstory in stories if tstory != hstory]), stim_dict[hstory]
     tresp, hresp = torch.vstack([resp_dict[tstory] for tstory in stories if tstory != hstory]), resp_dict[hstory]
     tstim, hstim = tstim.cuda(), hstim.cuda()
     tresp, hresp = tresp.cuda(), hresp.cuda()
-    bs_weights = ridge_torch(tstim, tresp, alphas[vox])
+    bs_weights = ridge_torch(tstim, tresp, alphas)
     bs_weights = bs_weights.to(hstim.device).to(hstim.dtype)
     pred = hstim.matmul(bs_weights)
     # resids = hresp - pred

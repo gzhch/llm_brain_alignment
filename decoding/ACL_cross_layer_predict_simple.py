@@ -203,10 +203,13 @@ for b in range(5):
 test_data = {k: torch.cat([i[k] for i in test_data]) for k in test_data[0].keys()}
 
 
-layer2 = args.layer2
+# layer2 = args.layer2
 projectors = []
-for layer1 in range(0, 32, 2):
-# for layer1 in [10]:
+# for layer1 in range(0, 32, 2):
+# for layer1 in range(1, 31, 2):
+#     layer2 = layer1 + 2
+for layer1 in range(0, 31, 1):
+    layer2 = layer1 + 1
     net = LinearProjector(input_size, output_size).cuda()
     proj = dict(layer1=layer1, 
                 layer2=layer2,
@@ -272,8 +275,4 @@ for proj in projectors:
     layer2 = proj['layer2']
     save_path = os.path.join(log_dir, f'net_{layer1}_{layer2}.pt')
     torch.save(proj['net'].half(), save_path)
-
-
-
-
 

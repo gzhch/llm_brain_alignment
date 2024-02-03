@@ -6,6 +6,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from torch.nn.functional import softmax
 import utils_llama.activation as ana
 
+
 class LLAMA():    
     def __init__(self, model, tokenizer, cache_dir): 
         self.model = model
